@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="The Long Game">
+<title>The Long Game</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  body{margin:0;padding:0;background:#f7f5f2;font-family:Georgia,serif;color:#1a1a1a;}
+  input,textarea,button{font-family:Georgia,serif;}
+  textarea{-webkit-appearance:none;}
+  ::-webkit-scrollbar{width:4px;}
+  ::-webkit-scrollbar-thumb{background:#e0dbd4;border-radius:2px;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+const STORAGE_KEY = "matt-fitness-tracker-v4";
+const BASELINE = { weight:76, smm:34.3, bodyFat:15.4, pbf:20.3, date:"2026-03-09" };
+const TARGETS  = { weight:73.6, smm:36.3, bodyFat:11.0, pbf:15.0, date:"2026-09-01" };
+const MACROS   = {
+  training: { calories:2200, protein:165, carbs:220, fat:65 },
+  rest:     { calories:1900, protein:160, carbs:170, fat:65 },
+};
+const IDEAL_FAT_RATE = 0.075;
+const IDEAL_SMM_RATE = 0.05;
+const LIFT_LOCATIONS = ["gym","building gym","home"];
+
+const C = {
+  bg:"#f7f5f2", surface:"#ffffff", border:"#e0dbd4",
+  text:"#1a1a1a", textMid:"#555", textLight:"#999",
+  accent:"#b8621a", green:"#2a7a3b", red:"#c0392b",
+  blue:"#1a5a8a", gridLine:"#ede9e3",
+  dangerBg:"#fdf0ee", danger:"#c0392b",
+  trainingBg:"#eef4ff", restBg:"#f5f0ff",
+  trainingBorder:"#b8cce8", restBorder:"#c8b8e8",
+  trainingText:"#1a5a8a", restText:"#5a1a8a",
+  missedBg:"#fdf8ee", missedBorder:"#e8d5a0", missedText:"#8a6a1a",
+  coachBg:"#f0f4ff", coachBorder:"#b8c8e8", coachText:"#1a3a6a",
+};
+
+// ── Storage (localStorage) ────────────────────────────────────────────────────
+const storage = {
+  get(key) { try { const v=localStorage.getItem(key); return v?JSON.parse(v):null; } catch(e){ return null; } },
+  set(key,val) { try { localStorage.setItem(key,JSON.stringify(val)); } catch(e){ console.error(e); } },
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function todayStr() {
+  const d=new Date();
+  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+}
+function localDateStr(d) {
+  return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
+}
+function dateKeyToDisplay(dk) {
+  return new Date(dk+"T12:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short"});
+}
+function getCurrentWeekLabel() {
+  const now=new Date(), s=new Date(now);
+  s.setDate(now.getDate()-((now.getDay()+6)%7));
+  return s.toLocaleDateString("en-GB",{day:"numeric",month:"short"});
+}
+function getRecentDateOptions() {
+  return Array.from({length:4},(_,i)=>{
+    const d=new Date(); d.setDate(d.getDate()-i);
+    return { key:localDateStr(d), label:i===0?"Today":i===1?"Yesterday":d.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short"}) };
+  });
+}
+function daysUntilWedding() { return Math.round((new Date("2027-10-06")-new Date())/86400000); }
+function weeksSinceBaseline() { return Math.max(0,Math.round((new Date()-new Date(BASELINE.date))/(86400000*7))); }
+function getLiftSessions(day) { if(!day?.lifts) return []; if(Array.isArray(day.lifts)) return day.lifts; return Array.from({length:day.lifts},()=>({location:"gym"})); }
+function getLiftCount(day) { return getLiftSessions(day).length; }
+function getDayType(day) { if(day?.type) return day.type; return (getLiftCount(day)>0||day?.runs?.length>0)?"training":"rest"; }
+function weekAvg(days,field) { const v=days.filter(d=>d[field]>0); return v.length?Math.round(v.reduce((a,d)=>a+d[field],0)/v.length):0; }
+
+function getRollingWeightAvg(allWeeks,currentWeek,today) {
+  const allDays=[];
+  [...allWeeks,currentWeek].forEach(w=>(w.days||[]).forEach(d=>allDays.push(d)));
+  allDays.push(today);
+  const ww=allDays.filter(d=>d.weight&&d.dateKey).sort((a,b)=>a.dateKey.localeCompare(b.dateKey));
+  if(ww.length<2) return null;
+  return ww.map((d,i)=>{
+    const win=ww.slice(Math.max(0,i-6),i+1);
+    return {dateKey:d.dateKey, avg:Math.round(win.reduce((a,x)=>a+x.weight,0)/win.length*10)/10};
+  });
+}
+
+function calcWeeklyCompliance(allDays) {
+  const logged=allDays.filter(d=>d.calories>0||d.protein>0);
+  if(!logged.length) return null;
+  const met=logged.filter(d=>{ const t=MACROS[getDayType(d)]; return d.protein>=t.protein*0.9&&d.calories>=t.calories*0.85&&d.calories<=t.calories*1.15; });
+  const active=allDays.filter(d=>getLiftCount(d)>0||d.runs?.length>0).length;
+  return { macroRate:Math.round(met.length/logged.length*100), daysLogged:logged.length, activityDays:active,
+    score:Math.round((met.length/Math.max(logged.length,1)*0.6+Math.min(1,active/4)*0.4)*100) };
+}
+
+function getMissedDays(currentWeek,today) {
+  const keys=new Set([...(currentWeek.days||[]).map(d=>d.dateKey),today.dateKey]);
+  const now=new Date(), ws=new Date(now);
+  ws.setDate(now.getDate()-((now.getDay()+6)%7));
+  const missed=[];
+  for(let d=new Date(ws);d<now;d.setDate(d.getDate()+1)){
+    const k=localDateStr(d); if(!keys.has(k)) missed.push(k);
+  }
+  return missed;
+}
+
+function buildChartData(allWeeks,rollingAvg) {
+  const totalWeeks=30, pts=[];
+  const afp=[];
+  if(rollingAvg&&rollingAvg.length>=2) {
+    rollingAvg.forEach(({dateKey,avg})=>{
+      const wk=Math.round((new Date(dateKey+"T12:00:00")-new Date(BASELINE.date))/(86400000*7));
+      afp.push({week:wk,val:avg-(BASELINE.weight-BASELINE.bodyFat)});
+    });
+  } else {
+    allWeeks.forEach(w=>w.days?.forEach(d=>{ if(d.weight&&d.loggedAt){ const wk=Math.round((new Date(d.loggedAt)-new Date(BASELINE.date))/(86400000*7)); afp.push({week:wk,val:d.weight-(BASELINE.weight-BASELINE.bodyFat)}); } }));
+  }
+  let fatSlope=-IDEAL_FAT_RATE, smmSlope=IDEAL_SMM_RATE;
+  if(afp.length>=2){ const n=afp.length,sX=afp.reduce((a,p)=>a+p.week,0),sY=afp.reduce((a,p)=>a+p.val,0),sXY=afp.reduce((a,p)=>a+p.week*p.val,0),sX2=afp.reduce((a,p)=>a+p.week*p.week,0); fatSlope=(n*sXY-sX*sY)/(n*sX2-sX*sX); }
+  for(let w=0;w<=totalWeeks;w++) pts.push({week:w,idealFat:Math.max(TARGETS.bodyFat,BASELINE.bodyFat-w*IDEAL_FAT_RATE),idealSMM:Math.min(TARGETS.smm,BASELINE.smm+w*IDEAL_SMM_RATE),actualFat:Math.max(8,BASELINE.bodyFat+w*fatSlope),actualSMM:Math.min(39,BASELINE.smm+w*smmSlope)});
+  return {points:pts,fatSlope,smmSlope};
+}
+
+function calcBuffDate(fatSlope,smmSlope) {
+  const wF=fatSlope<0?(TARGETS.bodyFat-BASELINE.bodyFat)/fatSlope:Infinity;
+  const wS=smmSlope>0?(TARGETS.smm-BASELINE.smm)/smmSlope:Infinity;
+  const wN=Math.max(wF,wS);
+  if(!isFinite(wN)||wN>200) return null;
+  const d=new Date(BASELINE.date); d.setDate(d.getDate()+Math.round(wN*7));
+  return {date:d,weeks:Math.round(wN)};
+}
+
+function exportCSV(allWeeks,currentWeek,today) {
+  const allDays=[];
+  [...allWeeks,currentWeek].forEach(w=>(w.days||[]).forEach(d=>allDays.push({week:w.weekLabel,...d})));
+  allDays.push({week:currentWeek.weekLabel,...today});
+  const headers=["week","date","dayType","calories","protein","carbs","fat","lifts","liftLocations","runs","weight","sleep","stress"];
+  const rows=allDays.map(d=>[d.week||"",d.date||"",getDayType(d),d.calories||0,d.protein||0,d.carbs||0,d.fat||0,getLiftCount(d),getLiftSessions(d).map(s=>s.location).join("+"),( d.runs||[]).map(r=>r.distance+"km").join("+")||"",d.weight||"",d.sleep||"",d.stress||""]);
+  const csv=[headers,...rows].map(r=>r.join(",")).join("\n");
+  const url=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+  const a=document.createElement("a"); a.href=url; a.download="fitness-log-"+todayStr()+".csv"; a.click(); URL.revokeObjectURL(url);
+}
+
+function buildCoachingSummary(allWeeks,currentWeek,today) {
+  const allDays=[];
+  [...allWeeks,currentWeek].forEach(w=>(w.days||[]).forEach(d=>allDays.push({week:w.weekLabel,...d})));
+  allDays.push({week:"Current week",...today});
+  const tDays=allDays.filter(d=>getDayType(d)==="training"&&d.calories>0);
+  const rDays=allDays.filter(d=>getDayType(d)==="rest"&&d.calories>0);
+  const avgT=f=>tDays.length?Math.round(tDays.reduce((a,d)=>a+d[f],0)/tDays.length):0;
+  const avgR=f=>rDays.length?Math.round(rDays.reduce((a,d)=>a+d[f],0)/rDays.length):0;
+  const totalRuns=allDays.reduce((a,d)=>a+(d.runs?.length||0),0);
+  const totalLifts=allDays.reduce((a,d)=>a+getLiftCount(d),0);
+  const liftLocs=allDays.flatMap(d=>getLiftSessions(d).map(s=>s.location));
+  const locBd=LIFT_LOCATIONS.map(l=>l+":"+liftLocs.filter(x=>x===l).length).join(", ");
+  const weights=allDays.filter(d=>d.weight).map(d=>d.weight);
+  const sl=allDays.filter(d=>d.sleep>0).map(d=>d.sleep);
+  const st=allDays.filter(d=>d.stress>0).map(d=>d.stress);
+  const avgSl=sl.length?(sl.reduce((a,b)=>a+b,0)/sl.length).toFixed(1):null;
+  const avgSt=st.length?(st.reduce((a,b)=>a+b,0)/st.length).toFixed(1):null;
+  const comp=calcWeeklyCompliance(allDays.filter(d=>!d.missed));
+  const r14=allDays.slice(-14).map(d=>
+    d.date+" ["+getDayType(d)+"]: "+d.calories+"kcal "+d.protein+"g-P "+d.carbs+"g-C "+d.fat+"g-F"+
+    " lifts:"+getLiftCount(d)+(getLiftSessions(d).length?"("+getLiftSessions(d).map(s=>s.location).join(",")+")" :"")+
+    " runs:"+(d.runs?.length||0)+(d.weight?" wt:"+d.weight+"kg":"")+(d.sleep?" sleep:"+d.sleep+"/5":"")+(d.stress?" stress:"+d.stress+"/5":"")
+  ).join("\n");
+  return "MATT'S FITNESS DATA — "+new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})+"\n\n"+
+    "BASELINE (9 Mar 2026): 76kg, 183cm, 20.3% body fat, SMM 34.3kg\n"+
+    "TARGETS (Sep 2026): -4.4kg fat, +2kg muscle\nWEEKS IN: "+weeksSinceBaseline()+"\n\n"+
+    "MACRO TARGETS:\n- Training: 2200kcal, 165g P, 220g C, 65g F\n- Rest: 1900kcal, 160g P, 170g C, 65g F\n\n"+
+    "SUMMARY:\n- Days: "+allDays.length+" | Training: "+tDays.length+" | Rest: "+rDays.length+"\n"+
+    "- Training avgs: "+avgT("calories")+"kcal, "+avgT("protein")+"g P, "+avgT("carbs")+"g C, "+avgT("fat")+"g F\n"+
+    "- Rest avgs: "+avgR("calories")+"kcal, "+avgR("protein")+"g P, "+avgR("carbs")+"g C, "+avgR("fat")+"g F\n"+
+    "- Runs: "+totalRuns+" | Lifts: "+totalLifts+" ("+locBd+")\n"+
+    "- Latest weight: "+(weights.length?weights[weights.length-1]+"kg":"not logged")+"\n"+
+    "- Sleep: "+(avgSl?avgSl+"/5":"not logged")+" | Stress: "+(avgSt?avgSt+"/5":"not logged")+"\n"+
+    "- Compliance: "+(comp?comp.score+"/100 (macro hit: "+comp.macroRate+"%)":"insufficient data")+"\n\n"+
+    "RECENT 14 DAYS:\n"+r14;
+}
+
+const emptyDay = () => ({ id:Date.now(), dateKey:todayStr(), date:new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short"}), type:null, protein:0, carbs:0, fat:0, calories:0, lifts:[], runs:[], weight:null, sleep:0, stress:0, loggedAt:new Date().toISOString() });
+const emptyWeek = () => ({ id:Date.now(), weekLabel:getCurrentWeekLabel(), days:[], loggedAt:new Date().toISOString() });
+
+// ── Small components ──────────────────────────────────────────────────────────
+function MacroRing({label,value,target,color,unit="g"}) {
+  const pct=Math.min(100,target>0?(value/target)*100:0);
+  const r=28,circ=2*Math.PI*r,ok=pct>=90;
+  return (
+    <div style={{textAlign:"center"}}>
+      <svg width="72" height="72" viewBox="0 0 72 72">
+        <circle cx="36" cy="36" r={r} fill="none" stroke={C.gridLine} strokeWidth="5"/>
+        <circle cx="36" cy="36" r={r} fill="none" stroke={color} strokeWidth="5"
+          strokeDasharray={(pct/100)*circ+" "+circ} strokeLinecap="round"
+          transform="rotate(-90 36 36)" opacity={ok?1:0.7}/>
+        <text x="36" y="33" textAnchor="middle" fontSize="11" fontWeight="bold" fill={C.text} fontFamily="Georgia">{value}</text>
+        <text x="36" y="44" textAnchor="middle" fontSize="8" fill={C.textLight} fontFamily="Georgia">{unit}</text>
+      </svg>
+      <div style={{fontSize:"0.58rem",color:ok?color:C.textLight,textTransform:"uppercase",letterSpacing:"0.1em",marginTop:"2px"}}>{label}</div>
+      <div style={{fontSize:"0.55rem",color:C.textLight}}>/ {target}{unit}</div>
+    </div>
+  );
+}
+
+function DayBadge({type}) {
+  const isT=type==="training";
+  return <span style={{display:"inline-block",padding:"2px 8px",borderRadius:"10px",fontSize:"0.55rem",letterSpacing:"0.15em",textTransform:"uppercase",fontWeight:"bold",background:isT?C.trainingBg:C.restBg,color:isT?C.trainingText:C.restText,border:"1px solid "+(isT?C.trainingBorder:C.restBorder)}}>{isT?"Training Day":"Rest Day"}</span>;
+}
+
+function RatingRow({label,value,onChange,lowLabel,highLabel,color}) {
+  return (
+    <div style={{marginBottom:"12px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"5px"}}>
+        <span style={{fontSize:"0.62rem",textTransform:"uppercase",letterSpacing:"0.12em",color:C.textMid}}>{label}</span>
+        {value>0&&<span style={{fontSize:"0.75rem",fontWeight:"bold",color}}>{value}/5</span>}
+      </div>
+      <div style={{display:"flex",gap:"6px"}}>
+        {[1,2,3,4,5].map(n=>(
+          <button key={n} onClick={()=>onChange(value===n?0:n)} style={{flex:1,padding:"8px 0",borderRadius:"4px",cursor:"pointer",border:"1px solid "+(value>=n?color:C.border),background:value>=n?color:C.surface,color:value>=n?"#fff":C.textLight,fontSize:"0.75rem",fontWeight:"bold"}}>{n}</button>
+        ))}
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:"3px"}}>
+        <span style={{fontSize:"0.55rem",color:C.textLight}}>{lowLabel}</span>
+        <span style={{fontSize:"0.55rem",color:C.textLight}}>{highLabel}</span>
+      </div>
+    </div>
+  );
+}
+
+function ComplianceCard({compliance}) {
+  if(!compliance) return <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:"6px",padding:"14px",marginBottom:"14px",textAlign:"center"}}><div style={{fontSize:"0.62rem",color:C.textLight}}>Log a few days to see compliance</div></div>;
+  const sc=compliance.score>=80?C.green:compliance.score>=55?C.accent:C.red;
+  return (
+    <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:"6px",padding:"14px",marginBottom:"14px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"10px"}}>
+        <div style={{fontSize:"0.58rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight}}>Weekly Compliance</div>
+        <div style={{fontSize:"1.6rem",fontWeight:"bold",color:sc,lineHeight:1}}>{compliance.score}<span style={{fontSize:"0.8rem",fontWeight:"normal",color:C.textLight}}>/100</span></div>
+      </div>
+      <div style={{background:C.gridLine,borderRadius:"3px",height:"6px",overflow:"hidden",marginBottom:"10px"}}>
+        <div style={{width:compliance.score+"%",height:"100%",background:sc,borderRadius:"3px"}}/>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"8px"}}>
+        {[{label:"Days logged",value:compliance.daysLogged,color:C.text},{label:"Macros hit",value:compliance.macroRate+"%",color:compliance.macroRate>=80?C.green:C.accent},{label:"Active days",value:compliance.activityDays,color:compliance.activityDays>=3?C.green:C.accent}].map(({label,value,color})=>(
+          <div key={label} style={{textAlign:"center"}}>
+            <div style={{fontSize:"1rem",fontWeight:"bold",color}}>{value}</div>
+            <div style={{fontSize:"0.55rem",color:C.textLight,lineHeight:"1.3"}}>{label}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MissedDayBanner({missedDays,onLogMissed}) {
+  if(!missedDays.length) return null;
+  return (
+    <div style={{background:C.missedBg,border:"1px solid "+C.missedBorder,borderRadius:"6px",padding:"12px 14px",marginBottom:"14px"}}>
+      <div style={{fontSize:"0.65rem",fontWeight:"bold",color:C.missedText,marginBottom:"4px"}}>⚠ {missedDays.length} unlogged day{missedDays.length>1?"s":""} this week</div>
+      <div style={{fontSize:"0.62rem",color:C.textMid,marginBottom:"8px"}}>{missedDays.map(dk=>dateKeyToDisplay(dk)).join(", ")}</div>
+      <button onClick={()=>onLogMissed(missedDays[0])} style={{width:"100%",background:C.missedBorder,border:"none",color:C.missedText,padding:"8px",borderRadius:"4px",cursor:"pointer",fontSize:"0.62rem",letterSpacing:"0.1em",textTransform:"uppercase",fontWeight:"bold"}}>Log {dateKeyToDisplay(missedDays[0])}</button>
+    </div>
+  );
+}
+
+function ProgressBar({label,current,baseline,target,percent,color}) {
+  return (
+    <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:"4px",padding:"10px 14px",marginBottom:"8px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:"5px"}}>
+        <span style={{fontSize:"0.62rem",textTransform:"uppercase",letterSpacing:"0.1em",color:C.textMid}}>{label}</span>
+        <span style={{fontSize:"0.75rem",fontWeight:"bold",color}}>{current}</span>
+      </div>
+      <div style={{background:C.gridLine,borderRadius:"2px",height:"5px",overflow:"hidden"}}>
+        <div style={{width:Math.max(2,percent)+"%",height:"100%",background:color,borderRadius:"2px"}}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:"3px"}}>
+        <span style={{color:C.textLight,fontSize:"0.58rem"}}>{baseline}</span>
+        <span style={{color:C.textLight,fontSize:"0.58rem"}}>{Math.round(percent)}% → {target}</span>
+      </div>
+    </div>
+  );
+}
+
+function ManualInput({label,onAdd,placeholder}) {
+  const [val,setVal]=useState("");
+  return (
+    <div style={{marginBottom:"8px"}}>
+      <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"5px"}}>{label}</div>
+      <div style={{display:"flex",gap:"8px"}}>
+        <input value={val} onChange={e=>setVal(e.target.value)} placeholder={placeholder} style={{flex:1,background:C.surface,border:"1px solid "+C.border,borderRadius:"4px",color:C.text,padding:"9px 11px",fontSize:"0.85rem"}}/>
+        <button onClick={()=>{if(val){onAdd(val);setVal("");}}} style={{background:C.accent,border:"none",color:"#fff",padding:"9px 14px",borderRadius:"4px",cursor:"pointer",fontSize:"0.85rem"}}>+</button>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({label,sub,items,accent}) {
+  return (
+    <div style={{background:accent?"#f0f7f0":C.surface,border:"1px solid "+(accent?"#b8d8b8":C.border),borderRadius:"6px",padding:"12px"}}>
+      <div style={{fontSize:"0.58rem",textTransform:"uppercase",letterSpacing:"0.15em",color:accent?C.green:C.textLight,marginBottom:"2px"}}>{label}</div>
+      <div style={{fontSize:"0.55rem",color:C.textLight,marginBottom:"8px"}}>{sub}</div>
+      {items.map((item,i)=><div key={i} style={{fontSize:"0.8rem",color:C.text,marginBottom:"2px",fontWeight:accent?"bold":"normal"}}>{item}</div>)}
+    </div>
+  );
+}
+
+// ── Trajectory chart ──────────────────────────────────────────────────────────
+function TrajectoryChart({allWeeks,currentWeek,today}) {
+  const rollingAvg=getRollingWeightAvg(allWeeks,currentWeek,today);
+  const {points,fatSlope,smmSlope}=buildChartData(allWeeks,rollingAvg);
+  const buffDate=calcBuffDate(fatSlope,smmSlope);
+  const curWk=weeksSinceBaseline();
+  const W=320,H=200,PAD={top:12,right:16,bottom:28,left:38};
+  const cw=W-PAD.left-PAD.right,ch=H-PAD.top-PAD.bottom;
+  const TOTAL=30,fMin=9,fMax=16;
+  const xP=w=>PAD.left+(w/TOTAL)*cw;
+  const yF=v=>PAD.top+ch-((v-fMin)/(fMax-fMin))*ch;
+  const yS=v=>{const mn=33,mx=38;return PAD.top+ch-((v-mn)/(mx-mn))*ch;};
+  const mp=(pts,yFn)=>pts.map((p,i)=>(i===0?"M":"L")+" "+xP(p.week).toFixed(1)+" "+yFn(p.val).toFixed(1)).join(" ");
+  const ticks=[0,5,10,15,20,25,30];
+  const rPts=rollingAvg?.map(({dateKey,avg})=>({week:Math.round((new Date(dateKey+"T12:00:00")-new Date(BASELINE.date))/(86400000*7)),val:avg-(BASELINE.weight-BASELINE.bodyFat)}))||[];
+  return (
+    <div>
+      <div style={{display:"flex",gap:"10px",marginBottom:"10px",flexWrap:"wrap"}}>
+        {[["Fat ideal",C.red,null],["Fat trend",C.red,"5 3"],["Muscle ideal",C.green,null],["Muscle trend",C.green,"5 3"],["Actual wt",C.accent,"5 2"]].map(([l,c,da])=>(
+          <div key={l} style={{display:"flex",alignItems:"center",gap:"4px"}}>
+            <svg width="18" height="8"><line x1="0" y1="4" x2="18" y2="4" stroke={c} strokeWidth={l==="Actual wt"?2:1.5} strokeDasharray={da||undefined}/></svg>
+            <span style={{fontSize:"0.58rem",color:C.textMid}}>{l}</span>
+          </div>
+        ))}
+      </div>
+      <svg width="100%" viewBox={"0 0 "+W+" "+H} style={{overflow:"visible"}}>
+        {[10,11,12,13,14,15].map(v=><line key={v} x1={PAD.left} x2={PAD.left+cw} y1={yF(v)} y2={yF(v)} stroke={C.gridLine} strokeWidth="0.5"/>)}
+        {ticks.map(w=><line key={w} x1={xP(w)} x2={xP(w)} y1={PAD.top} y2={PAD.top+ch} stroke={C.gridLine} strokeWidth="0.5"/>)}
+        <path d={mp(points.map(p=>({week:p.week,val:p.idealFat})),yF)} fill="none" stroke={C.red} strokeWidth="1.8" opacity="0.85"/>
+        <path d={mp(points.map(p=>({week:p.week,val:p.idealSMM})),yS)} fill="none" stroke={C.green} strokeWidth="1.8" opacity="0.85"/>
+        <path d={mp(points.map(p=>({week:p.week,val:p.actualFat})),yF)} fill="none" stroke={C.red} strokeWidth="1.5" strokeDasharray="5 3" opacity="0.6"/>
+        <path d={mp(points.map(p=>({week:p.week,val:p.actualSMM})),yS)} fill="none" stroke={C.green} strokeWidth="1.5" strokeDasharray="5 3" opacity="0.6"/>
+        {rPts.length>=2&&<path d={mp(rPts,yF)} fill="none" stroke={C.accent} strokeWidth="2" strokeDasharray="5 2" opacity="0.9"/>}
+        {rPts.length>0&&<circle cx={xP(rPts[rPts.length-1].week)} cy={yF(rPts[rPts.length-1].val)} r="3" fill={C.accent}/>}
+        <line x1={xP(curWk)} x2={xP(curWk)} y1={PAD.top} y2={PAD.top+ch} stroke={C.accent} strokeWidth="1" strokeDasharray="3 2"/>
+        <text x={xP(curWk)+3} y={PAD.top+9} fill={C.accent} fontSize="7.5" fontFamily="Georgia">now</text>
+        {buffDate&&buffDate.weeks<=30&&<>
+          <line x1={xP(buffDate.weeks)} x2={xP(buffDate.weeks)} y1={PAD.top} y2={PAD.top+ch} stroke={C.blue} strokeWidth="1" strokeDasharray="3 2"/>
+          <text x={xP(buffDate.weeks)+3} y={PAD.top+18} fill={C.blue} fontSize="7.5" fontFamily="Georgia">buff</text>
+        </>}
+        {ticks.map(w=><text key={w} x={xP(w)} y={H-6} textAnchor="middle" fill={C.textLight} fontSize="7" fontFamily="Georgia">{"w"+w}</text>)}
+        {[10,12,14].map(v=><text key={v} x={PAD.left-4} y={yF(v)+3} textAnchor="end" fill={C.red} fontSize="7" fontFamily="Georgia" opacity="0.8">{v}</text>)}
+        <line x1={PAD.left} x2={PAD.left} y1={PAD.top} y2={PAD.top+ch} stroke={C.border} strokeWidth="1"/>
+        <line x1={PAD.left} x2={PAD.left+cw} y1={PAD.top+ch} y2={PAD.top+ch} stroke={C.border} strokeWidth="1"/>
+      </svg>
+      {rollingAvg&&rollingAvg.length>0&&<div style={{marginTop:"6px",fontSize:"0.62rem",color:C.accent,textAlign:"right"}}>7-day rolling avg: <strong>{rollingAvg[rollingAvg.length-1].avg}kg</strong></div>}
+      <div style={{marginTop:"10px",padding:"12px 14px",background:buffDate?"#eef4ff":"#fff8f0",border:"1px solid "+(buffDate?"#b8cce8":"#e8c8a0"),borderRadius:"4px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <div style={{fontSize:"0.55rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"3px"}}>Trend hits target</div>
+          <div style={{fontSize:"1rem",fontWeight:"bold",color:buffDate?C.blue:C.accent}}>{buffDate?buffDate.date.toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}):"Log weight to project"}</div>
+        </div>
+        {buffDate&&<div style={{textAlign:"right"}}><div style={{fontSize:"0.55rem",color:C.textLight,textTransform:"uppercase"}}>weeks away</div><div style={{fontSize:"1.5rem",fontWeight:"bold",color:C.blue}}>{Math.max(0,buffDate.weeks-weeksSinceBaseline())}</div></div>}
+      </div>
+    </div>
+  );
+}
+
+// ── Edit panel ────────────────────────────────────────────────────────────────
+function EditPanel({day,onUpdate}) {
+  const [editField,setEditField]=useState(null);
+  const [editVal,setEditVal]=useState("");
+  const rs={display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 12px",background:C.surface,border:"1px solid "+C.border,borderRadius:"4px",marginBottom:"6px"};
+  const sB=(color,bg,label,onClick)=><button onClick={onClick} style={{background:bg,border:"none",color,padding:"4px 9px",borderRadius:"3px",cursor:"pointer",fontSize:"0.62rem",marginLeft:"5px"}}>{label}</button>;
+  const saveF=k=>{const v=parseFloat(editVal);if(!isNaN(v))onUpdate({...day,[k]:v});setEditField(null);};
+  return (
+    <div>
+      <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"6px"}}>Day Type Override</div>
+      <div style={{display:"flex",gap:"8px",marginBottom:"14px"}}>
+        {[["training","Training"],["rest","Rest"],[null,"Auto"]].map(([t,label])=>(
+          <button key={String(t)} onClick={()=>onUpdate({...day,type:t})} style={{flex:1,padding:"8px",borderRadius:"4px",cursor:"pointer",border:"1px solid "+(day.type===t?C.accent:C.border),background:day.type===t?"#fff8f0":C.surface,color:day.type===t?C.accent:C.textMid,fontSize:"0.62rem",textTransform:"uppercase"}}>{label}</button>
+        ))}
+      </div>
+      <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"6px"}}>Macros</div>
+      {[{key:"calories",label:"Calories",unit:"kcal"},{key:"protein",label:"Protein",unit:"g"},{key:"carbs",label:"Carbs",unit:"g"},{key:"fat",label:"Fat",unit:"g"}].map(({key,label,unit})=>(
+        <div key={key}>{editField===key?(
+          <div style={rs}>
+            <input value={editVal} onChange={e=>setEditVal(e.target.value)} autoFocus style={{width:"80px",background:C.bg,border:"1px solid "+C.border,borderRadius:"3px",padding:"5px 8px",fontSize:"0.85rem",color:C.text}}/>
+            <span style={{color:C.textLight,fontSize:"0.75rem"}}>{unit}</span>
+            <div style={{marginLeft:"auto"}}>{sB("#fff",C.green,"Save",()=>saveF(key))}{sB(C.textMid,C.bg,"Cancel",()=>setEditField(null))}</div>
+          </div>
+        ):(
+          <div style={rs}>
+            <span style={{fontSize:"0.85rem",color:C.text}}>{label}</span>
+            <div style={{display:"flex",alignItems:"center"}}>
+              <span style={{fontSize:"0.9rem",fontWeight:"bold",color:C.text,marginRight:"8px"}}>{day[key]||0}{unit}</span>
+              {sB(C.accent,"#fff8f0","Edit",()=>{setEditField(key);setEditVal(String(day[key]||0));})}
+              {sB(C.danger,C.dangerBg,"✕",()=>onUpdate({...day,[key]:0}))}
+            </div>
+          </div>
+        )}</div>
+      ))}
+      {day.runs?.length>0&&<>
+        <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"6px",marginTop:"10px"}}>Runs</div>
+        {day.runs.map((r,i)=><div key={i} style={rs}><span style={{fontSize:"0.9rem",fontWeight:"bold"}}>{r.distance}km{r.hr?" · "+r.hr+"bpm":""}</span>{sB(C.danger,C.dangerBg,"✕",()=>onUpdate({...day,runs:day.runs.filter((_,idx)=>idx!==i)}))}</div>)}
+      </>}
+      {getLiftCount(day)>0&&<>
+        <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"6px",marginTop:"10px"}}>Lifts</div>
+        {getLiftSessions(day).map((s,i)=>(
+          <div key={i} style={rs}>
+            <span style={{fontSize:"0.9rem",fontWeight:"bold"}}>{s.location==="gym"?"🏋️":s.location==="building gym"?"🏢":"🏠"} {s.location}</span>
+            {sB(C.danger,C.dangerBg,"✕",()=>onUpdate({...day,lifts:getLiftSessions(day).filter((_,idx)=>idx!==i)}))}
+          </div>
+        ))}
+      </>}
+      {day.weight&&<>
+        <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"6px",marginTop:"10px"}}>Weight</div>
+        {editField==="weight"?(
+          <div style={rs}>
+            <input value={editVal} onChange={e=>setEditVal(e.target.value)} autoFocus style={{width:"80px",background:C.bg,border:"1px solid "+C.border,borderRadius:"3px",padding:"5px 8px",fontSize:"0.85rem",color:C.text}}/>
+            <span style={{color:C.textLight,fontSize:"0.75rem"}}>kg</span>
+            <div style={{marginLeft:"auto"}}>{sB("#fff",C.green,"Save",()=>{onUpdate({...day,weight:parseFloat(editVal)});setEditField(null);})}{sB(C.textMid,C.bg,"Cancel",()=>setEditField(null))}</div>
+          </div>
+        ):(
+          <div style={rs}>
+            <span style={{fontSize:"0.9rem",fontWeight:"bold"}}>{day.weight}kg</span>
+            <div>{sB(C.accent,"#fff8f0","Edit",()=>{setEditField("weight");setEditVal(String(day.weight));})}{sB(C.danger,C.dangerBg,"✕",()=>onUpdate({...day,weight:null}))}</div>
+          </div>
+        )}
+      </>}
+    </div>
+  );
+}
+
+// ── Paste parser ──────────────────────────────────────────────────────────────
+function PasteParser({selectedDateKey,getDayForDate,saveDayForDate}) {
+  const [text,setText]=useState("");
+  const [saved,setSaved]=useState(false);
+  function parse(raw) {
+    const l=raw.toLowerCase(), u={};
+    const cal=l.match(/(\d+)\s*(?:kcal|calories|cal\b)/); if(cal) u.calories=parseInt(cal[1]);
+    const pro=l.match(/(\d+)\s*g?\s*protein/);            if(pro) u.protein=parseInt(pro[1]);
+    const car=l.match(/(\d+)\s*g?\s*carbs?/);             if(car) u.carbs=parseInt(car[1]);
+    const fat=l.match(/(\d+)\s*g?\s*fat\b/);              if(fat) u.fat=parseInt(fat[1]);
+    const run=l.match(/(\d+\.?\d*)\s*km/);
+    if(run){ const hr=l.match(/(\d{2,3})\s*bpm/); u.run={distance:parseFloat(run[1]),hr:hr?parseInt(hr[1]):null}; }
+    const wt=l.match(/weigh(?:ed|s)?\s*(\d+\.?\d*)/)||l.match(/(\d+\.?\d*)\s*kg\s*(?:today|now|weight)/);
+    if(wt) u.weight=parseFloat(wt[1]);
+    if(l.match(/\blift\b|workout|push|pull|hinge/)) u.lift=true;
+    return u;
+  }
+  function handleSave() {
+    if(!text.trim()) return;
+    const p=parse(text), base=getDayForDate(selectedDateKey), updated={...base};
+    if(p.calories) updated.calories=(updated.calories||0)+p.calories;
+    if(p.protein)  updated.protein=(updated.protein||0)+p.protein;
+    if(p.carbs)    updated.carbs=(updated.carbs||0)+p.carbs;
+    if(p.fat)      updated.fat=(updated.fat||0)+p.fat;
+    if(p.weight)   updated.weight=p.weight;
+    if(p.run)      updated.runs=[...(updated.runs||[]),p.run];
+    if(p.lift)     updated.lifts=[...getLiftSessions(updated),{location:"gym"}];
+    saveDayForDate(selectedDateKey,updated);
+    setText(""); setSaved(true); setTimeout(()=>setSaved(false),2500);
+  }
+  return (
+    <div>
+      <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"6px"}}>Paste Claude's response</div>
+      <textarea value={text} onChange={e=>{setText(e.target.value);setSaved(false);}}
+        placeholder="e.g. 165g protein, 220g carbs, 65g fat, 2100 kcal, 6.5km run 145bpm"
+        style={{width:"100%",background:C.surface,border:"1px solid "+C.border,borderRadius:"4px",color:C.text,padding:"11px",fontSize:"0.82rem",lineHeight:"1.6",minHeight:"80px",resize:"vertical",boxSizing:"border-box"}}/>
+      <button onClick={handleSave} disabled={!text.trim()}
+        style={{marginTop:"6px",width:"100%",background:saved?C.green:C.accent,border:"none",color:"#fff",padding:"12px",borderRadius:"4px",cursor:text.trim()?"pointer":"not-allowed",fontSize:"0.7rem",letterSpacing:"0.2em",textTransform:"uppercase",fontWeight:"bold"}}>
+        {saved?"✓ Logged":"Log Entry"}
+      </button>
+    </div>
+  );
+}
+
+// ── Coach page ────────────────────────────────────────────────────────────────
+function CoachPage({allWeeks,currentWeek,today}) {
+  const [copied,setCopied]=useState(false);
+  const summary=buildCoachingSummary(allWeeks,currentWeek,today);
+  const totalDays=allWeeks.reduce((a,w)=>a+(w.days?.length||0),0)+(currentWeek.days?.length||0);
+  const hasData=totalDays>0||today.calories>0;
+  function copySummary() {
+    navigator.clipboard.writeText(summary).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2500);}).catch(()=>{
+      const el=document.createElement("textarea"); el.value=summary; document.body.appendChild(el); el.select(); document.execCommand("copy"); document.body.removeChild(el);
+      setCopied(true); setTimeout(()=>setCopied(false),2500);
+    });
+  }
+  return (
+    <div>
+      <div style={{fontSize:"0.58rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight,marginBottom:"12px"}}>Coaching Export</div>
+      <div style={{background:C.coachBg,border:"1px solid "+C.coachBorder,borderRadius:"8px",padding:"14px",marginBottom:"14px"}}>
+        <div style={{fontSize:"0.75rem",fontWeight:"bold",color:C.coachText,marginBottom:"8px"}}>How to get a coaching analysis</div>
+        <div style={{fontSize:"0.7rem",color:C.textMid,lineHeight:"1.8"}}>
+          <div>1. Tap <strong>Copy Summary</strong> below</div>
+          <div>2. Open a new chat with Claude</div>
+          <div>3. Paste and add: <em>"Give me a coaching review"</em></div>
+        </div>
+      </div>
+      {!hasData&&<div style={{background:"#fff8f0",border:"1px solid #e8c8a0",borderRadius:"6px",padding:"12px 14px",marginBottom:"14px",fontSize:"0.72rem",color:C.textMid}}>Log a few days first.</div>}
+      <button onClick={copySummary} disabled={!hasData}
+        style={{width:"100%",background:copied?C.green:C.coachText,border:"none",color:"#fff",padding:"14px",borderRadius:"6px",cursor:hasData?"pointer":"not-allowed",fontSize:"0.72rem",letterSpacing:"0.15em",textTransform:"uppercase",fontWeight:"bold",marginBottom:"12px"}}>
+        {copied?"✓ Copied!":"Copy Summary for Claude"}
+      </button>
+      <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"6px"}}>Preview</div>
+      <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:"6px",padding:"14px",fontSize:"0.68rem",color:C.textMid,lineHeight:"1.7",fontFamily:"monospace",whiteSpace:"pre-wrap",wordBreak:"break-word",maxHeight:"240px",overflowY:"auto"}}>{summary}</div>
+      <div style={{marginTop:"16px",paddingTop:"14px",borderTop:"1px solid "+C.border}}>
+        <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"8px"}}>Full Data Export</div>
+        <button onClick={()=>exportCSV(allWeeks,currentWeek,today)} style={{width:"100%",background:C.surface,border:"1px solid "+C.border,color:C.textMid,padding:"11px",borderRadius:"4px",cursor:"pointer",fontSize:"0.62rem",letterSpacing:"0.12em",textTransform:"uppercase"}}>⬇ Download CSV</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Guide page ────────────────────────────────────────────────────────────────
+function GuidePage() {
+  return (
+    <div>
+      <div style={{fontSize:"0.58rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight,marginBottom:"14px"}}>Day Type Guide</div>
+      {[
+        {type:"training",title:"Training Day",color:C.trainingText,bg:C.trainingBg,border:C.trainingBorder,desc:"Any day with a run or lift.",macros:[["Calories","2,200 kcal"],["Protein","165g"],["Carbs","220g"],["Fat","65g"]],tips:[["🥚","Breakfast","4 eggs + oats"],["🍗","Pre-workout","Chicken with rice"],["🥤","Post-workout","Protein shake within 60 min"],["🍚","Dinner","Lean protein + carbs"],["🥛","Before bed","Greek yoghurt"]]},
+        {type:"rest",title:"Rest Day",color:C.restText,bg:C.restBg,border:C.restBorder,desc:"No runs, no lifting. Protein stays high.",macros:[["Calories","1,900 kcal"],["Protein","160g"],["Carbs","170g"],["Fat","65g"]],tips:[["🥚","Same protein","Eggs, chicken, yoghurt, shakes"],["🥗","Less carbs","Skip extra rice/bread"],["🐟","Lean proteins","Fish, egg whites, turkey"],["🫘","Volume","Chickpeas, lentils, salad"],["⚠️","Evening","Front-load calories"]]}
+      ].map(({type,title,color,bg,border,desc,macros,tips})=>(
+        <div key={type} style={{background:bg,border:"1px solid "+border,borderRadius:"8px",padding:"16px",marginBottom:"14px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"10px"}}>
+            <div style={{fontSize:"1rem",fontWeight:"bold",color}}>{title}</div>
+            <DayBadge type={type}/>
+          </div>
+          <div style={{fontSize:"0.7rem",color:C.textMid,marginBottom:"10px",lineHeight:"1.6"}}>{desc}</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"6px",marginBottom:"12px"}}>
+            {macros.map(([l,v])=><div key={l} style={{background:C.surface,borderRadius:"4px",padding:"7px 10px"}}><div style={{fontSize:"0.55rem",color:C.textLight,textTransform:"uppercase"}}>{l}</div><div style={{fontSize:"0.88rem",fontWeight:"bold",color}}>{v}</div></div>)}
+          </div>
+          <div style={{fontSize:"0.65rem",color:C.textMid,lineHeight:"1.7"}}>
+            <div style={{fontWeight:"bold",color:C.text,marginBottom:"4px"}}>Best ways:</div>
+            {tips.map(([icon,label,text])=><div key={label}>{icon} <strong>{label}:</strong> {text}</div>)}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── History / Entries table ───────────────────────────────────────────────────
+function HistoryPage({allWeeks,currentWeek,today,saveDayForDate}) {
+  const [editingDateKey,setEditingDateKey]=useState(null);
+
+  const allDays=[];
+  [...allWeeks,currentWeek].forEach(w=>(w.days||[]).forEach(d=>allDays.push({weekLabel:w.weekLabel,...d})));
+  allDays.push({weekLabel:"This week",...today});
+  const logged=allDays.filter(d=>(d.calories>0||d.protein>0||getLiftCount(d)>0||d.runs?.length>0)&&!d.missed).reverse();
+
+  const thStyle={padding:"8px 6px",fontSize:"0.55rem",letterSpacing:"0.1em",textTransform:"uppercase",color:C.textLight,textAlign:"left",borderBottom:"2px solid "+C.border,whiteSpace:"nowrap"};
+  const tdStyle={padding:"8px 6px",fontSize:"0.72rem",color:C.text,borderBottom:"1px solid "+C.gridLine,verticalAlign:"middle"};
+  const tdNum={...tdStyle,textAlign:"right",fontVariantNumeric:"tabular-nums"};
+
+  function hitTarget(d,field) {
+    const t=MACROS[getDayType(d)];
+    if(field==="calories") return d.calories>=t.calories*0.85&&d.calories<=t.calories*1.15;
+    if(field==="protein")  return d.protein>=t.protein*0.9;
+    return true;
+  }
+
+  function handleUpdate(dk,updated) {
+    saveDayForDate(dk,updated);
+    // Refresh the displayed day in allDays by re-deriving (state will update via parent)
+  }
+
+  return (
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"10px",marginBottom:"16px"}}>
+        <StatCard label="Baseline" sub="09 Mar 2026" items={["76kg","20.3% fat","SMM 34.3kg"]}/>
+        <StatCard label="Target" sub="Sep 2026" items={["~73.6kg","~15% fat","SMM 36.3kg"]} accent/>
+      </div>
+
+      <div style={{fontSize:"0.58rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight,marginBottom:"10px"}}>All Entries — tap ✏ to edit</div>
+
+      {logged.length===0?(
+        <div style={{color:C.textLight,fontSize:"0.8rem",textAlign:"center",padding:"32px 0"}}>No entries yet — start logging.</div>
+      ):(
+        <div>
+          <div style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:"0.72rem",minWidth:"520px"}}>
+              <thead>
+                <tr>
+                  <th style={thStyle}>Date</th>
+                  <th style={thStyle}>Type</th>
+                  <th style={{...thStyle,textAlign:"right"}}>kcal</th>
+                  <th style={{...thStyle,textAlign:"right"}}>P</th>
+                  <th style={{...thStyle,textAlign:"right"}}>C</th>
+                  <th style={{...thStyle,textAlign:"right"}}>F</th>
+                  <th style={thStyle}>Activity</th>
+                  <th style={{...thStyle,textAlign:"right"}}>Wt</th>
+                  <th style={{...thStyle,textAlign:"center"}}>😴</th>
+                  <th style={{...thStyle,textAlign:"center"}}>😤</th>
+                  <th style={thStyle}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {logged.map((d,i)=>{
+                  const isT=getDayType(d)==="training";
+                  const calOk=hitTarget(d,"calories"), proOk=hitTarget(d,"protein");
+                  const isEditing=editingDateKey===d.dateKey;
+                  return (
+                    <React.Fragment key={d.id||i}>
+                      <tr style={{background:isEditing?"#fff8f0":i%2===0?C.surface:"#fafaf8",cursor:"pointer"}} onClick={()=>setEditingDateKey(isEditing?null:d.dateKey)}>
+                        <td style={tdStyle}>
+                          <div style={{fontWeight:"bold"}}>{d.date}</div>
+                          <div style={{fontSize:"0.6rem",color:C.textLight}}>{d.weekLabel}</div>
+                        </td>
+                        <td style={tdStyle}>
+                          <span style={{fontSize:"0.55rem",padding:"2px 6px",borderRadius:"8px",background:isT?C.trainingBg:C.restBg,color:isT?C.trainingText:C.restText,border:"1px solid "+(isT?C.trainingBorder:C.restBorder),whiteSpace:"nowrap"}}>{isT?"Train":"Rest"}</span>
+                        </td>
+                        <td style={{...tdNum,color:d.calories>0?(calOk?C.green:C.accent):C.textLight}}>{d.calories||"—"}</td>
+                        <td style={{...tdNum,color:d.protein>0?(proOk?C.green:C.accent):C.textLight}}>{d.protein||"—"}</td>
+                        <td style={tdNum}>{d.carbs||"—"}</td>
+                        <td style={tdNum}>{d.fat||"—"}</td>
+                        <td style={tdStyle}>
+                          <div style={{display:"flex",gap:"4px",flexWrap:"wrap"}}>
+                            {(d.runs||[]).map((r,j)=><span key={j} style={{fontSize:"0.6rem",color:C.trainingText}}>🏃{r.distance}km</span>)}
+                            {getLiftSessions(d).map((s,j)=><span key={j} style={{fontSize:"0.6rem",color:C.trainingText}}>{s.location==="gym"?"🏋️":s.location==="building gym"?"🏢":"🏠"}</span>)}
+                            {getLiftCount(d)===0&&(d.runs||[]).length===0&&<span style={{fontSize:"0.6rem",color:C.textLight}}>—</span>}
+                          </div>
+                        </td>
+                        <td style={tdNum}>{d.weight?d.weight+"kg":"—"}</td>
+                        <td style={{...tdStyle,textAlign:"center",color:d.sleep>0?C.blue:C.textLight}}>{d.sleep||"—"}</td>
+                        <td style={{...tdStyle,textAlign:"center",color:d.stress>0?C.red:C.textLight}}>{d.stress||"—"}</td>
+                        <td style={{...tdStyle,textAlign:"center"}}>
+                          <button
+                            onClick={e=>{e.stopPropagation();setEditingDateKey(isEditing?null:d.dateKey);}}
+                            style={{background:isEditing?C.accent:"none",border:"1px solid "+(isEditing?C.accent:C.border),color:isEditing?"#fff":C.textLight,borderRadius:"4px",padding:"3px 8px",cursor:"pointer",fontSize:"0.65rem"}}>
+                            {isEditing?"✕":"✏"}
+                          </button>
+                        </td>
+                      </tr>
+                      {isEditing&&(
+                        <tr>
+                          <td colSpan="11" style={{padding:"0",borderBottom:"2px solid "+C.accent}}>
+                            <div style={{background:"#fff8f0",padding:"14px",borderLeft:"3px solid "+C.accent}}>
+                              <div style={{fontSize:"0.62rem",fontWeight:"bold",color:C.accent,marginBottom:"12px",letterSpacing:"0.1em",textTransform:"uppercase"}}>Editing — {d.date}</div>
+                              <EditPanel
+                                day={d}
+                                onUpdate={updated=>{
+                                  handleUpdate(d.dateKey,updated);
+                                  setEditingDateKey(null);
+                                }}
+                              />
+                              <button onClick={()=>setEditingDateKey(null)} style={{marginTop:"12px",width:"100%",background:"none",border:"1px solid "+C.border,color:C.textLight,padding:"9px",borderRadius:"4px",cursor:"pointer",fontSize:"0.62rem",letterSpacing:"0.12em",textTransform:"uppercase"}}>
+                                Cancel
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{fontSize:"0.6rem",color:C.textLight,marginTop:"8px",lineHeight:"1.5"}}>
+            Calories and protein colour: <span style={{color:C.green}}>■ on target</span> · <span style={{color:C.accent}}>■ off target</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main app ──────────────────────────────────────────────────────────────────
+function App() {
+  const [data,setData]=useState(null);
+  const [activeTab,setActiveTab]=useState("dashboard");
+  const [logSubTab,setLogSubTab]=useState("add");
+  const [today,setToday]=useState(emptyDay());
+  const [currentWeek,setCurrentWeek]=useState(emptyWeek());
+  const [loading,setLoading]=useState(true);
+  const [rolledOver,setRolledOver]=useState(false);
+  const [selectedDateKey,setSelectedDateKey]=useState(todayStr());
+
+  useEffect(()=>{ loadData(); },[]);
+
+  function loadData() {
+    const saved=storage.get(STORAGE_KEY);
+    if(saved) {
+      let loadedToday=saved.today||emptyDay();
+      let loadedWeek=saved.currentWeek||emptyWeek();
+      if(loadedToday.dateKey&&loadedToday.dateKey!==todayStr()){
+        const hadData=loadedToday.calories>0||loadedToday.protein>0||(loadedToday.runs?.length||0)>0||getLiftCount(loadedToday)>0;
+        if(hadData) loadedWeek={...loadedWeek,days:[...(loadedWeek.days||[]),loadedToday]};
+        else loadedWeek={...loadedWeek,days:[...(loadedWeek.days||[]),{...emptyDay(),dateKey:loadedToday.dateKey,date:loadedToday.date,missed:true,loggedAt:loadedToday.loggedAt}]};
+        loadedToday=emptyDay();
+        setRolledOver(true); setTimeout(()=>setRolledOver(false),4000);
+      }
+      const nd={...saved,currentWeek:loadedWeek,today:loadedToday};
+      setData(nd); setCurrentWeek(loadedWeek); setToday(loadedToday);
+    } else {
+      setData({weeks:[],currentWeek:emptyWeek(),today:emptyDay()});
+    }
+    setLoading(false);
+  }
+
+  function save(nd) { storage.set(STORAGE_KEY,nd); setData(nd); }
+
+  function updateToday(u) {
+    setToday(u);
+    setData(prev=>{ const nd={...prev,today:u,currentWeek}; storage.set(STORAGE_KEY,nd); return nd; });
+  }
+  function updateWeekAndToday(nw,nt) {
+    setCurrentWeek(nw); setToday(nt);
+    setData(prev=>{ const nd={...prev,currentWeek:nw,today:nt}; storage.set(STORAGE_KEY,nd); return nd; });
+  }
+
+  function getDayForDate(dk) {
+    if(dk===todayStr()) return today;
+    return currentWeek.days?.find(d=>d.dateKey===dk)||{...emptyDay(),dateKey:dk,date:dateKeyToDisplay(dk),loggedAt:new Date(dk+"T12:00:00").toISOString()};
+  }
+  function saveDayForDate(dk,updated) {
+    if(dk===todayStr()){ updateToday(updated); }
+    else {
+      const days=(currentWeek.days||[]).filter(d=>d.dateKey!==dk);
+      const nw={...currentWeek,days:[...days,updated]};
+      setCurrentWeek(nw);
+      setData(prev=>{ const nd={...prev,currentWeek:nw}; storage.set(STORAGE_KEY,nd); return nd; });
+    }
+  }
+  function archiveDay() { updateWeekAndToday({...currentWeek,days:[...(currentWeek.days||[]),today]},emptyDay()); }
+  function archiveWeek() {
+    const completed={...currentWeek,days:[...(currentWeek.days||[]),today]};
+    const nw=emptyWeek(),nt=emptyDay();
+    setCurrentWeek(nw); setToday(nt);
+    setData(prev=>{ const nd={...prev,weeks:[...(prev?.weeks||[]),completed],currentWeek:nw,today:nt}; storage.set(STORAGE_KEY,nd); return nd; });
+  }
+
+  const allWeeks=data?.weeks||[];
+  const dayType=getDayType(today);
+  const targets=MACROS[dayType];
+  const allDays=[...(currentWeek.days||[]),today];
+  const missedDays=getMissedDays(currentWeek,today);
+  const compliance=calcWeeklyCompliance(allDays.filter(d=>!d.missed));
+  const rollingAvg=getRollingWeightAvg(allWeeks,currentWeek,today);
+  const dayScore=Math.round(["calories","protein","carbs","fat"].reduce((acc,k)=>acc+Math.min(1,targets[k]>0?today[k]/targets[k]:0),0)/4*100);
+
+  const TABS=[{id:"dashboard",label:"Home"},{id:"chart",label:"Chart"},{id:"log",label:"Log"},{id:"entries",label:"Entries"},{id:"coach",label:"📋 Coach"},{id:"guide",label:"Guide"}];
+
+  if(loading) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:C.accent,letterSpacing:"0.2em"}}>Loading…</div>;
+
+  return (
+    <div style={{background:C.bg,minHeight:"100vh",maxWidth:"600px",margin:"0 auto"}}>
+      {rolledOver&&<div style={{background:"#f0f7f0",borderBottom:"1px solid #b8d8b8",padding:"10px 18px",fontSize:"0.7rem",color:"#2a7a3b",textAlign:"center"}}>✓ Yesterday saved — fresh day started</div>}
+
+      {/* Header */}
+      <div style={{background:C.surface,borderBottom:"1px solid "+C.border,padding:"16px 16px 0",position:"sticky",top:0,zIndex:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"12px"}}>
+          <div>
+            <div style={{fontSize:"0.55rem",letterSpacing:"0.3em",textTransform:"uppercase",color:C.accent,marginBottom:"2px"}}>Matt — Body Recomposition</div>
+            <div style={{fontSize:"1.2rem",fontWeight:"bold"}}>The Long Game</div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:"0.5rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight}}>Wedding</div>
+            <div style={{fontSize:"1rem",fontWeight:"bold"}}>{daysUntilWedding()}d</div>
+          </div>
+        </div>
+        <div style={{display:"flex",borderTop:"1px solid "+C.border,overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+          {TABS.map(tab=>(
+            <button key={tab.id} onClick={()=>setActiveTab(tab.id)} style={{background:"none",border:"none",whiteSpace:"nowrap",borderBottom:activeTab===tab.id?"2px solid "+C.accent:"2px solid transparent",color:activeTab===tab.id?C.accent:C.textLight,padding:"10px 10px",cursor:"pointer",fontSize:"0.58rem",letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:"-1px"}}>{tab.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{padding:"16px"}}>
+
+        {/* DASHBOARD */}
+        {activeTab==="dashboard"&&(
+          <div>
+            <MissedDayBanner missedDays={missedDays} onLogMissed={dk=>{setSelectedDateKey(dk);setActiveTab("log");setLogSubTab("add");}}/>
+            <div style={{background:dayType==="training"?C.trainingBg:C.restBg,border:"1px solid "+(dayType==="training"?C.trainingBorder:C.restBorder),borderRadius:"8px",padding:"16px",marginBottom:"14px"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px"}}>
+                <div>
+                  <div style={{fontSize:"0.58rem",color:C.textLight,textTransform:"uppercase",letterSpacing:"0.15em",marginBottom:"3px"}}>Today — {today.date}</div>
+                  <DayBadge type={dayType}/>
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <div style={{fontSize:"0.55rem",color:C.textLight,textTransform:"uppercase"}}>Score</div>
+                  <div style={{fontSize:"1.5rem",fontWeight:"bold",color:dayType==="training"?C.trainingText:C.restText}}>{dayScore}<span style={{fontSize:"0.8rem",fontWeight:"normal"}}>/100</span></div>
+                </div>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-around"}}>
+                <MacroRing label="Cal" value={today.calories} target={targets.calories} color={C.accent} unit="kcal"/>
+                <MacroRing label="Protein" value={today.protein} target={targets.protein} color={C.blue}/>
+                <MacroRing label="Carbs" value={today.carbs} target={targets.carbs} color={C.green}/>
+                <MacroRing label="Fat" value={today.fat} target={targets.fat} color={C.red}/>
+              </div>
+              {(today.runs?.length>0||getLiftCount(today)>0)&&(
+                <div style={{marginTop:"10px",paddingTop:"10px",borderTop:"1px solid "+(dayType==="training"?C.trainingBorder:C.restBorder)}}>
+                  {today.runs?.map((r,i)=><span key={i} style={{fontSize:"0.7rem",color:dayType==="training"?C.trainingText:C.restText,marginRight:"12px"}}>🏃 {r.distance}km{r.hr?" · "+r.hr+"bpm":""}</span>)}
+                  {getLiftSessions(today).map((s,i)=><span key={i} style={{fontSize:"0.7rem",color:dayType==="training"?C.trainingText:C.restText,marginRight:"8px"}}>{s.location==="gym"?"🏋️":s.location==="building gym"?"🏢":"🏠"} {s.location}</span>)}
+                </div>
+              )}
+              {(today.sleep>0||today.stress>0)&&(
+                <div style={{marginTop:"8px",paddingTop:"8px",borderTop:"1px solid "+(dayType==="training"?C.trainingBorder:C.restBorder),display:"flex",gap:"16px"}}>
+                  {today.sleep>0&&<span style={{fontSize:"0.7rem",color:C.blue}}>😴 Sleep {today.sleep}/5</span>}
+                  {today.stress>0&&<span style={{fontSize:"0.7rem",color:C.red}}>😤 Stress {today.stress}/5</span>}
+                </div>
+              )}
+            </div>
+            <ComplianceCard compliance={compliance}/>
+            <div style={{fontSize:"0.58rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight,marginBottom:"8px"}}>Week of {currentWeek.weekLabel}</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"14px"}}>
+              {[{label:"Training days",value:allDays.filter(d=>getDayType(d)==="training"&&!d.missed).length,color:C.trainingText,bg:C.trainingBg,border:C.trainingBorder},{label:"Rest days",value:allDays.filter(d=>getDayType(d)==="rest"&&(d.protein>0||d.calories>0)).length,color:C.restText,bg:C.restBg,border:C.restBorder},{label:"Avg protein",value:weekAvg(allDays.filter(d=>d.protein>0),"protein")+"g",color:C.blue,bg:C.surface,border:C.border},{label:"Avg calories",value:weekAvg(allDays.filter(d=>d.calories>0),"calories"),color:C.accent,bg:C.surface,border:C.border}].map(({label,value,color,bg,border})=>(
+                <div key={label} style={{background:bg,border:"1px solid "+border,borderRadius:"6px",padding:"10px 12px"}}>
+                  <div style={{fontSize:"0.55rem",color:C.textLight,textTransform:"uppercase",letterSpacing:"0.1em"}}>{label}</div>
+                  <div style={{fontSize:"1.1rem",fontWeight:"bold",color}}>{value}</div>
+                </div>
+              ))}
+            </div>
+            {rollingAvg&&rollingAvg.length>0&&(
+              <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:"6px",padding:"10px 14px",marginBottom:"14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div style={{fontSize:"0.62rem",color:C.textMid}}>7-day rolling weight avg</div>
+                <div style={{fontSize:"1rem",fontWeight:"bold",color:C.accent}}>{rollingAvg[rollingAvg.length-1].avg}kg</div>
+              </div>
+            )}
+            <div style={{fontSize:"0.58rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight,marginBottom:"8px"}}>Progress to Target</div>
+            <ProgressBar label="Body Fat" current={"~"+Math.max(TARGETS.bodyFat,BASELINE.bodyFat-weeksSinceBaseline()*IDEAL_FAT_RATE).toFixed(1)+"kg"} baseline={BASELINE.bodyFat+"kg"} target={TARGETS.bodyFat+"kg"} percent={Math.min(100,(weeksSinceBaseline()*IDEAL_FAT_RATE/(BASELINE.bodyFat-TARGETS.bodyFat))*100)} color={C.red}/>
+            <ProgressBar label="Muscle Mass" current={"~"+Math.min(TARGETS.smm,BASELINE.smm+weeksSinceBaseline()*IDEAL_SMM_RATE).toFixed(1)+"kg"} baseline={BASELINE.smm+"kg"} target={TARGETS.smm+"kg"} percent={Math.min(100,(weeksSinceBaseline()*IDEAL_SMM_RATE/(TARGETS.smm-BASELINE.smm))*100)} color={C.green}/>
+            <div style={{display:"flex",gap:"8px",marginTop:"14px"}}>
+              <button onClick={archiveDay} style={{flex:1,background:C.surface,border:"1px solid "+C.border,color:C.textMid,padding:"11px",borderRadius:"4px",cursor:"pointer",fontSize:"0.6rem",letterSpacing:"0.12em",textTransform:"uppercase"}}>Save Day</button>
+              <button onClick={archiveWeek} style={{flex:1,background:"none",border:"1px solid "+C.border,color:C.textLight,padding:"11px",borderRadius:"4px",cursor:"pointer",fontSize:"0.6rem",letterSpacing:"0.12em",textTransform:"uppercase"}}>Archive Week</button>
+            </div>
+          </div>
+        )}
+
+        {/* CHART */}
+        {activeTab==="chart"&&(
+          <div>
+            <div style={{fontSize:"0.58rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight,marginBottom:"12px"}}>Trajectory — Ideal vs Trend</div>
+            <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:"6px",padding:"16px"}}>
+              <TrajectoryChart allWeeks={allWeeks} currentWeek={currentWeek} today={today}/>
+            </div>
+          </div>
+        )}
+
+        {/* LOG */}
+        {activeTab==="log"&&(
+          <div>
+            <div style={{display:"flex",background:C.surface,border:"1px solid "+C.border,borderRadius:"6px",marginBottom:"14px",overflow:"hidden"}}>
+              {["add","edit"].map(sub=>(
+                <button key={sub} onClick={()=>setLogSubTab(sub)} style={{flex:1,background:logSubTab===sub?C.accent:"none",border:"none",color:logSubTab===sub?"#fff":C.textMid,padding:"10px",cursor:"pointer",fontSize:"0.62rem",letterSpacing:"0.15em",textTransform:"uppercase",fontWeight:logSubTab===sub?"bold":"normal"}}>
+                  {sub==="add"?"Add Entry":"Edit / Delete"}
+                </button>
+              ))}
+            </div>
+
+            {logSubTab==="add"&&(
+              <div>
+                <div style={{marginBottom:"14px"}}>
+                  <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"6px"}}>Logging for</div>
+                  <div style={{display:"flex",gap:"6px",flexWrap:"wrap"}}>
+                    {getRecentDateOptions().slice(0,4).map(({key,label})=>(
+                      <button key={key} onClick={()=>setSelectedDateKey(key)} style={{padding:"6px 12px",borderRadius:"16px",cursor:"pointer",border:"1px solid "+(selectedDateKey===key?C.accent:C.border),background:selectedDateKey===key?"#fff8f0":C.surface,color:selectedDateKey===key?C.accent:C.textMid,fontSize:"0.65rem",fontWeight:selectedDateKey===key?"bold":"normal",whiteSpace:"nowrap"}}>{label}</button>
+                    ))}
+                  </div>
+                  {selectedDateKey!==todayStr()&&<div style={{marginTop:"6px",fontSize:"0.62rem",color:C.accent,fontStyle:"italic"}}>Logging for {dateKeyToDisplay(selectedDateKey)} — saves to that day</div>}
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"14px"}}>
+                  <span style={{fontSize:"0.58rem",color:C.textLight,textTransform:"uppercase",letterSpacing:"0.12em"}}>Day type:</span>
+                  <DayBadge type={getDayType(getDayForDate(selectedDateKey))}/>
+                </div>
+                <div style={{background:C.coachBg,border:"1px solid "+C.coachBorder,borderRadius:"6px",padding:"10px 12px",marginBottom:"14px",fontSize:"0.68rem",color:C.coachText,lineHeight:"1.6"}}>
+                  💬 <strong>Describe your day to Claude in chat</strong> and paste the macro response below.
+                </div>
+                <PasteParser selectedDateKey={selectedDateKey} getDayForDate={getDayForDate} saveDayForDate={saveDayForDate}/>
+                <div style={{marginTop:"16px",fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"8px"}}>Or enter manually</div>
+                {[{label:"Calories (kcal)",key:"calories",placeholder:"e.g. 2100"},{label:"Protein (g)",key:"protein",placeholder:"e.g. 165"},{label:"Carbs (g)",key:"carbs",placeholder:"e.g. 210"},{label:"Fat (g)",key:"fat",placeholder:"e.g. 65"},{label:"Weight (kg)",key:"weight",placeholder:"e.g. 75.2"}].map(({label,key,placeholder})=>(
+                  <ManualInput key={key} label={label} placeholder={placeholder} onAdd={val=>{
+                    const base=getDayForDate(selectedDateKey);
+                    saveDayForDate(selectedDateKey,{...base,[key]:key==="weight"?parseFloat(val):(base[key]||0)+parseFloat(val)});
+                  }}/>
+                ))}
+                <ManualInput label="Run (km)" placeholder="e.g. 6.5" onAdd={val=>{
+                  const base=getDayForDate(selectedDateKey);
+                  saveDayForDate(selectedDateKey,{...base,runs:[...(base.runs||[]),{distance:parseFloat(val),hr:null}]});
+                }}/>
+                <div style={{marginTop:"4px"}}>
+                  <div style={{fontSize:"0.58rem",letterSpacing:"0.15em",textTransform:"uppercase",color:C.textLight,marginBottom:"5px"}}>Log Lift ({getLiftCount(getDayForDate(selectedDateKey))} logged)</div>
+                  <div style={{display:"flex",gap:"6px"}}>
+                    {LIFT_LOCATIONS.map(loc=>(
+                      <button key={loc} onClick={()=>{
+                        const base=getDayForDate(selectedDateKey);
+                        saveDayForDate(selectedDateKey,{...base,lifts:[...getLiftSessions(base),{location:loc}]});
+                      }} style={{flex:1,background:C.surface,border:"1px solid "+C.border,color:C.text,padding:"10px 4px",borderRadius:"4px",cursor:"pointer",fontSize:"0.6rem",letterSpacing:"0.08em",textTransform:"uppercase",lineHeight:"1.3",textAlign:"center"}}>
+                        {loc==="gym"?"🏋️":loc==="building gym"?"🏢":"🏠"}<br/>{loc}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:"6px",padding:"14px",marginTop:"12px"}}>
+                  <div style={{fontSize:"0.58rem",letterSpacing:"0.2em",textTransform:"uppercase",color:C.textLight,marginBottom:"12px"}}>Wellbeing — optional</div>
+                  <RatingRow label="Sleep quality" value={getDayForDate(selectedDateKey).sleep||0} onChange={v=>saveDayForDate(selectedDateKey,{...getDayForDate(selectedDateKey),sleep:v})} lowLabel="Terrible" highLabel="Excellent" color={C.blue}/>
+                  <RatingRow label="Stress level" value={getDayForDate(selectedDateKey).stress||0} onChange={v=>saveDayForDate(selectedDateKey,{...getDayForDate(selectedDateKey),stress:v})} lowLabel="None" highLabel="High" color={C.red}/>
+                </div>
+              </div>
+            )}
+            {logSubTab==="edit"&&<EditPanel day={getDayForDate(selectedDateKey)} onUpdate={d=>saveDayForDate(selectedDateKey,d)}/>}
+          </div>
+        )}
+
+        {/* ENTRIES TABLE */}
+        {activeTab==="entries"&&<HistoryPage allWeeks={allWeeks} currentWeek={currentWeek} today={today} saveDayForDate={saveDayForDate}/>}
+
+        {/* COACH */}
+        {activeTab==="coach"&&<CoachPage allWeeks={allWeeks} currentWeek={currentWeek} today={today}/>}
+
+        {/* GUIDE */}
+        {activeTab==="guide"&&<GuidePage/>}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
